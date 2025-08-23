@@ -662,7 +662,9 @@ impl AcpThreadView {
 
     pub fn title(&self) -> SharedString {
         match &self.thread_state {
-            ThreadState::Ready { .. } | ThreadState::Unauthenticated { .. } => "New Thread".into(),
+            ThreadState::Ready { .. } | ThreadState::Unauthenticated { .. } => {
+                self.agent.name().into()
+            }
             ThreadState::Loading { .. } => "Loading…".into(),
             ThreadState::LoadError(_) => "Failed to load".into(),
         }

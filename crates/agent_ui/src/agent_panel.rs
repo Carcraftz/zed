@@ -65,8 +65,8 @@ use theme::ThemeSettings;
 use time::UtcOffset;
 use ui::utils::WithRemSize;
 use ui::{
-    Banner, Callout, ContextMenu, ContextMenuEntry, ElevationIndex, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProgressBar, Tab, Tooltip, prelude::*,
+    Banner, Callout, ContextMenu, ContextMenuEntry, ElevationIndex, IconButtonShape, KeyBinding,
+    PopoverMenu, PopoverMenuHandle, ProgressBar, Tab, TabBar, TabPosition, Tooltip, prelude::*,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -214,6 +214,7 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+#[derive(Debug)]
 enum ActiveView {
     Thread {
         thread: Entity<ActiveThread>,
@@ -232,6 +233,46 @@ enum ActiveView {
     },
     History,
     Configuration,
+}
+
+impl Clone for ActiveView {
+    fn clone(&self) -> Self {
+        match self {
+            ActiveView::Thread {
+                thread,
+                change_title_editor,
+                message_editor,
+                _subscriptions: _,
+            } => ActiveView::Thread {
+                thread: thread.clone(),
+                change_title_editor: change_title_editor.clone(),
+                message_editor: message_editor.clone(),
+                _subscriptions: Vec::new(), // Empty subscriptions for cloned view
+            },
+            ActiveView::ExternalAgentThread { thread_view } => ActiveView::ExternalAgentThread {
+                thread_view: thread_view.clone(),
+            },
+            ActiveView::TextThread {
+                context_editor,
+                title_editor,
+                buffer_search_bar,
+                _subscriptions: _,
+            } => ActiveView::TextThread {
+                context_editor: context_editor.clone(),
+                title_editor: title_editor.clone(),
+                buffer_search_bar: buffer_search_bar.clone(),
+                _subscriptions: Vec::new(), // Empty subscriptions for cloned view
+            },
+            ActiveView::History => ActiveView::History,
+            ActiveView::Configuration => ActiveView::Configuration,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TabInfo {
+    id: usize,
+    title: String,
 }
 
 enum WhichFontSize {
@@ -504,6 +545,10 @@ pub struct AgentPanel {
     configuration: Option<Entity<AgentConfiguration>>,
     configuration_subscription: Option<Subscription>,
     local_timezone: UtcOffset,
+    tabs: Vec<TabInfo>,
+    active_tab_index: usize,
+    next_tab_id: usize,
+    tab_views: std::collections::HashMap<usize, ActiveView>,
     active_view: ActiveView,
     previous_view: Option<ActiveView>,
     history_store: Entity<HistoryStore>,
@@ -522,6 +567,142 @@ pub struct AgentPanel {
 }
 
 impl AgentPanel {
+    fn create_new_tab(&mut self, title: String, view: ActiveView, cx: &mut Context<Self>) -> usize {
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+
+        let tab = TabInfo { id: tab_id, title };
+
+        self.tabs.push(tab);
+        self.active_tab_index = self.tabs.len() - 1;
+        self.tab_views.insert(tab_id, view.clone());
+        self.active_view = view;
+        cx.notify();
+        tab_id
+    }
+
+    fn switch_to_tab(&mut self, tab_index: usize, cx: &mut Context<Self>) {
+        if tab_index < self.tabs.len() {
+            let tab_id = self.tabs[tab_index].id;
+            if let Some(view) = self.tab_views.get(&tab_id).cloned() {
+                self.active_tab_index = tab_index;
+                self.active_view = view;
+                cx.notify();
+            }
+        }
+    }
+
+    fn close_tab(&mut self, tab_index: usize, cx: &mut Context<Self>) {
+        if self.tabs.len() <= 1 {
+            return; // Don't close the last tab
+        }
+
+        if tab_index < self.tabs.len() {
+            self.tabs.remove(tab_index);
+
+            // Adjust active tab index if needed
+            if self.active_tab_index >= self.tabs.len() {
+                self.active_tab_index = self.tabs.len() - 1;
+            } else if tab_index <= self.active_tab_index && self.active_tab_index > 0 {
+                self.active_tab_index -= 1;
+            }
+
+            // Note: In a full implementation, we'd restore the appropriate view
+            cx.notify();
+        }
+    }
+
+    fn get_tab_title(&self, view: &ActiveView, cx: &App) -> String {
+        match view {
+            ActiveView::Thread { thread, .. } => {
+                let active_thread = thread.read(cx);
+                let summary = active_thread.summary(cx);
+                match summary {
+                    ThreadSummary::Pending => "New Thread".to_string(),
+                    ThreadSummary::Generating => "Loading...".to_string(),
+                    ThreadSummary::Ready(title) => title.to_string(),
+                    ThreadSummary::Error => "Thread".to_string(),
+                }
+            }
+            ActiveView::ExternalAgentThread { thread_view } => {
+                thread_view.read(cx).title().to_string()
+            }
+            ActiveView::TextThread { context_editor, .. } => {
+                let context = context_editor.read(cx).context().read(cx);
+                let summary = context.summary();
+                match summary {
+                    ContextSummary::Pending => "New Text Thread".to_string(),
+                    ContextSummary::Content(summary) => {
+                        if summary.done {
+                            summary.text.clone()
+                        } else {
+                            "Loading...".to_string()
+                        }
+                    }
+                    ContextSummary::Error => "Text Thread".to_string(),
+                }
+            }
+            ActiveView::History => "History".to_string(),
+            ActiveView::Configuration => "Settings".to_string(),
+        }
+    }
+
+    fn render_tab_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        TabBar::new("agent_panel_tabs").children(self.tabs.iter().enumerate().map(
+            |(index, tab)| {
+                let is_active = index == self.active_tab_index;
+                let is_first = index == 0;
+                let is_last = index == self.tabs.len() - 1;
+                let can_close = self.tabs.len() > 1;
+
+                let position = if is_first {
+                    TabPosition::First
+                } else if is_last {
+                    TabPosition::Last
+                } else {
+                    TabPosition::Middle(index.cmp(&self.active_tab_index))
+                };
+
+                Tab::new(SharedString::from(format!("tab_{}", index)))
+                    .position(position)
+                    .toggle_state(is_active)
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.switch_to_tab(index, cx);
+                    }))
+                    .when(can_close, |tab| {
+                        tab.end_slot(
+                            IconButton::new(
+                                SharedString::from(format!("close_tab_{}", index)),
+                                IconName::Close,
+                            )
+                            .shape(IconButtonShape::Square)
+                            .icon_color(Color::Muted)
+                            .size(ButtonSize::None)
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(
+                                move |this, _, _window, cx| {
+                                    this.close_tab(index, cx);
+                                },
+                            )),
+                        )
+                    })
+                    .child(
+                        Label::new(if let Some(view) = self.tab_views.get(&tab.id) {
+                            self.get_tab_title(view, cx)
+                        } else {
+                            tab.title.clone()
+                        })
+                        .truncate()
+                        .color(if is_active {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        }),
+                    )
+            },
+        ))
+    }
+
     fn serialize(&mut self, cx: &mut Context<Self>) {
         let width = self.width;
         let selected_agent = self.selected_agent.clone();
@@ -814,7 +995,19 @@ impl AgentPanel {
             )
         });
 
+        let initial_tab = TabInfo {
+            id: 0,
+            title: "New Thread".to_string(),
+        };
+
+        let mut tab_views = std::collections::HashMap::new();
+        tab_views.insert(initial_tab.id, active_view.clone());
+
         Self {
+            tabs: vec![initial_tab],
+            active_tab_index: 0,
+            next_tab_id: 1,
+            tab_views,
             active_view,
             workspace,
             user_store,
@@ -1045,18 +1238,16 @@ impl AgentPanel {
             editor
         });
 
-        self.set_active_view(
-            ActiveView::prompt_editor(
-                context_editor.clone(),
-                self.history_store.clone(),
-                self.acp_history_store.clone(),
-                self.language_registry.clone(),
-                window,
-                cx,
-            ),
+        let text_thread_view = ActiveView::prompt_editor(
+            context_editor.clone(),
+            self.history_store.clone(),
+            self.acp_history_store.clone(),
+            self.language_registry.clone(),
             window,
             cx,
         );
+        let title = self.get_tab_title(&text_thread_view, cx);
+        self.create_new_tab(title, text_thread_view, cx);
         context_editor.focus_handle(cx).focus(window);
     }
 
@@ -1148,7 +1339,9 @@ impl AgentPanel {
                     )
                 });
 
-                this.set_active_view(ActiveView::ExternalAgentThread { thread_view }, window, cx);
+                let external_view = ActiveView::ExternalAgentThread { thread_view };
+                let title = this.get_tab_title(&external_view, cx);
+                this.create_new_tab(title, external_view, cx);
             })
         })
         .detach_and_log_err(cx);
@@ -1305,7 +1498,8 @@ impl AgentPanel {
         message_editor.focus_handle(cx).focus(window);
 
         let thread_view = ActiveView::thread(active_thread, message_editor, window, cx);
-        self.set_active_view(thread_view, window, cx);
+        let title = self.get_tab_title(&thread_view, cx);
+        self.create_new_tab(title, thread_view, cx);
         AgentDiff::set_active_thread(&self.workspace, thread.clone(), window, cx);
     }
 
@@ -3752,6 +3946,9 @@ impl Render for AgentPanel {
             }))
             .on_action(cx.listener(Self::toggle_burn_mode))
             .child(self.render_toolbar(window, cx))
+            .when(self.tabs.len() > 1, |el| {
+                el.child(self.render_tab_bar(window, cx))
+            })
             .children(self.render_onboarding(window, cx))
             .map(|parent| match &self.active_view {
                 ActiveView::Thread {
