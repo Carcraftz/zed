@@ -274,9 +274,9 @@ pub struct AcpThreadView {
     edits_expanded: bool,
     plan_expanded: bool,
     editor_expanded: bool,
-    terminal_expanded: bool,
     editing_message: Option<usize>,
     prompt_capabilities: Rc<Cell<PromptCapabilities>>,
+    is_loading_contents: bool,
     _cancel_task: Option<Task<()>>,
     _subscriptions: [Subscription; 3],
 }
@@ -385,10 +385,10 @@ impl AcpThreadView {
             edits_expanded: false,
             plan_expanded: false,
             editor_expanded: false,
-            terminal_expanded: true,
             history_store,
             hovered_recent_history_item: None,
             prompt_capabilities,
+            is_loading_contents: false,
             _subscriptions: subscriptions,
             _cancel_task: None,
             focus_handle: cx.focus_handle(),
@@ -825,6 +825,11 @@ impl AcpThreadView {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self.thread() else { return };
+
+        if self.is_loading_contents {
+            return;
+        }
+
         self.history_store.update(cx, |history, cx| {
             history.push_recently_opened_entry(
                 HistoryEntryId::AcpThread(thread.read(cx).session_id().clone()),
@@ -878,6 +883,15 @@ impl AcpThreadView {
         let Some(thread) = self.thread().cloned() else {
             return;
         };
+
+        self.is_loading_contents = true;
+        let guard = cx.new(|_| ());
+        cx.observe_release(&guard, |this, _guard, cx| {
+            this.is_loading_contents = false;
+            cx.notify();
+        })
+        .detach();
+
         let task = cx.spawn_in(window, async move |this, cx| {
             let (contents, tracked_buffers) = contents.await?;
 
@@ -898,6 +912,7 @@ impl AcpThreadView {
                         action_log.buffer_read(buffer, cx)
                     }
                 });
+                drop(guard);
                 thread.send(contents, cx)
             })?;
             send.await
@@ -952,19 +967,24 @@ impl AcpThreadView {
         let Some(thread) = self.thread().cloned() else {
             return;
         };
+        if self.is_loading_contents {
+            return;
+        }
 
-        let Some(rewind) = thread.update(cx, |thread, cx| {
-            let user_message_id = thread.entries().get(entry_ix)?.user_message()?.id.clone()?;
-            Some(thread.rewind(user_message_id, cx))
+        let Some(user_message_id) = thread.update(cx, |thread, _| {
+            thread.entries().get(entry_ix)?.user_message()?.id.clone()
         }) else {
             return;
         };
 
         let contents = message_editor.update(cx, |message_editor, cx| message_editor.contents(cx));
 
-        let task = cx.foreground_executor().spawn(async move {
-            rewind.await?;
-            contents.await
+        let task = cx.spawn(async move |_, cx| {
+            let contents = contents.await?;
+            thread
+                .update(cx, |thread, cx| thread.rewind(user_message_id, cx))?
+                .await?;
+            Ok(contents)
         });
         self.send_impl(task, window, cx);
     }
@@ -1343,25 +1363,34 @@ impl AcpThreadView {
                                         base_container
                                             .child(
                                                 IconButton::new("cancel", IconName::Close)
+                                                    .disabled(self.is_loading_contents)
                                                     .icon_color(Color::Error)
                                                     .icon_size(IconSize::XSmall)
                                                     .on_click(cx.listener(Self::cancel_editing))
                                             )
                                             .child(
-                                                IconButton::new("regenerate", IconName::Return)
-                                                    .icon_color(Color::Muted)
-                                                    .icon_size(IconSize::XSmall)
-                                                    .tooltip(Tooltip::text(
-                                                        "Editing will restart the thread from this point."
-                                                    ))
-                                                    .on_click(cx.listener({
-                                                        let editor = editor.clone();
-                                                        move |this, _, window, cx| {
-                                                            this.regenerate(
-                                                                entry_ix, &editor, window, cx,
-                                                            );
-                                                        }
-                                                    })),
+                                                if self.is_loading_contents {
+                                                    div()
+                                                        .id("loading-edited-message-content")
+                                                        .tooltip(Tooltip::text("Loading Added Context…"))
+                                                        .child(loading_contents_spinner(IconSize::XSmall))
+                                                        .into_any_element()
+                                                } else {
+                                                    IconButton::new("regenerate", IconName::Return)
+                                                        .icon_color(Color::Muted)
+                                                        .icon_size(IconSize::XSmall)
+                                                        .tooltip(Tooltip::text(
+                                                            "Editing will restart the thread from this point."
+                                                        ))
+                                                        .on_click(cx.listener({
+                                                            let editor = editor.clone();
+                                                            move |this, _, window, cx| {
+                                                                this.regenerate(
+                                                                    entry_ix, &editor, window, cx,
+                                                                );
+                                                            }
+                                                        })).into_any_element()
+                                                }
                                             )
                                     )
                                 } else {
@@ -1693,10 +1722,9 @@ impl AcpThreadView {
             matches!(tool_call.kind, acp::ToolKind::Edit) || tool_call.diffs().next().is_some();
         let use_card_layout = needs_confirmation || is_edit;
 
-        let is_collapsible = !tool_call.content.is_empty() && !use_card_layout;
+        let is_collapsible = !tool_call.content.is_empty() && !needs_confirmation;
 
-        let is_open =
-            needs_confirmation || is_edit || self.expanded_tool_calls.contains(&tool_call.id);
+        let is_open = needs_confirmation || self.expanded_tool_calls.contains(&tool_call.id);
 
         let gradient_overlay = |color: Hsla| {
             div()
@@ -2166,6 +2194,8 @@ impl AcpThreadView {
             .map(|path| format!("{}", path.display()))
             .unwrap_or_else(|| "current directory".to_string());
 
+        let is_expanded = self.expanded_tool_calls.contains(&tool_call.id);
+
         let header = h_flex()
             .id(SharedString::from(format!(
                 "terminal-tool-header-{}",
@@ -2299,21 +2329,27 @@ impl AcpThreadView {
                         "terminal-tool-disclosure-{}",
                         terminal.entity_id()
                     )),
-                    self.terminal_expanded,
+                    is_expanded,
                 )
                 .opened_icon(IconName::ChevronUp)
                 .closed_icon(IconName::ChevronDown)
-                .on_click(cx.listener(move |this, _event, _window, _cx| {
-                    this.terminal_expanded = !this.terminal_expanded;
-                })),
-            );
+                .on_click(cx.listener({
+                    let id = tool_call.id.clone();
+                    move |this, _event, _window, _cx| {
+                        if is_expanded {
+                            this.expanded_tool_calls.remove(&id);
+                        } else {
+                            this.expanded_tool_calls.insert(id.clone());
+                        }
+                    }})),
+                );
 
         let terminal_view = self
             .entry_view_state
             .read(cx)
             .entry(entry_ix)
             .and_then(|entry| entry.terminal(terminal));
-        let show_output = self.terminal_expanded && terminal_view.is_some();
+        let show_output = is_expanded && terminal_view.is_some();
 
         v_flex()
             .mb_2()
@@ -3544,7 +3580,14 @@ impl AcpThreadView {
             .thread()
             .is_some_and(|thread| thread.read(cx).status() != ThreadStatus::Idle);
 
-        if is_generating && is_editor_empty {
+        if self.is_loading_contents {
+            div()
+                .id("loading-message-content")
+                .px_1()
+                .tooltip(Tooltip::text("Loading Added Context…"))
+                .child(loading_contents_spinner(IconSize::default()))
+                .into_any_element()
+        } else if is_generating && is_editor_empty {
             IconButton::new("stop-generation", IconName::Stop)
                 .icon_color(Color::Error)
                 .style(ButtonStyle::Tinted(ui::TintColor::Error))
@@ -4643,6 +4686,18 @@ impl AcpThreadView {
         };
         task.detach_and_log_err(cx);
     }
+}
+
+fn loading_contents_spinner(size: IconSize) -> AnyElement {
+    Icon::new(IconName::LoadCircle)
+        .size(size)
+        .color(Color::Accent)
+        .with_animation(
+            "load_context_circle",
+            Animation::new(Duration::from_secs(3)).repeat(),
+            |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+        )
+        .into_any_element()
 }
 
 impl Focusable for AcpThreadView {
