@@ -74,6 +74,7 @@ pub enum MessageEditorEvent {
     Send,
     Cancel,
     Focus,
+    LostFocus,
 }
 
 impl EventEmitter<MessageEditorEvent> for MessageEditor {}
@@ -131,8 +132,12 @@ impl MessageEditor {
             editor
         });
 
-        cx.on_focus(&editor.focus_handle(cx), window, |_, _, cx| {
+        cx.on_focus_in(&editor.focus_handle(cx), window, |_, _, cx| {
             cx.emit(MessageEditorEvent::Focus)
+        })
+        .detach();
+        cx.on_focus_out(&editor.focus_handle(cx), window, |_, _, _, cx| {
+            cx.emit(MessageEditorEvent::LostFocus)
         })
         .detach();
 
@@ -368,7 +373,7 @@ impl MessageEditor {
 
         if Img::extensions().contains(&extension) && !extension.contains("svg") {
             if !self.prompt_capabilities.get().image {
-                return Task::ready(Err(anyhow!("This agent does not support images yet")));
+                return Task::ready(Err(anyhow!("This model does not support images yet")));
             }
             let task = self
                 .project
@@ -1169,16 +1174,15 @@ impl MessageEditor {
         })
     }
 
+    pub fn text(&self, cx: &App) -> String {
+        self.editor.read(cx).text(cx)
+    }
+
     #[cfg(test)]
     pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
             editor.set_text(text, window, cx);
         });
-    }
-
-    #[cfg(test)]
-    pub fn text(&self, cx: &App) -> String {
-        self.editor.read(cx).text(cx)
     }
 }
 
